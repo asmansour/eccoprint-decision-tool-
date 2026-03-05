@@ -1,0 +1,1328 @@
+<!DOCTYPE html>
+<html lang="da">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ecco Print – Digital eller Flexo?</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://alcdn.msauth.net/browser/2.38.1/js/msal-browser.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f3f4f6; }
+    nav.topnav { position: sticky; top: 0; z-index: 100; background: rgba(243,244,246,0.92); backdrop-filter: blur(12px); border-bottom: 1px solid #e5e7eb; padding: 0 24px; }
+    nav.topnav .inner { max-width: 900px; margin: 0 auto; display: flex; align-items: center; gap: 32px; height: 52px; }
+    nav.topnav .logo { font-weight: 700; font-size: 15px; color: #1c1917; letter-spacing: -0.02em; }
+    nav.topnav .logo span { color: #a8a29e; font-weight: 400; }
+    nav.topnav a { font-size: 13px; font-weight: 600; color: #57534e; text-decoration: none; padding: 4px 0; border-bottom: 2px solid transparent; transition: all 0.15s; }
+    nav.topnav a:hover { color: #1c1917; }
+    nav.topnav a.active { color: #1c1917; border-color: #1c1917; }
+  </style>
+</head>
+<body>
+  <nav class="topnav">
+    <div class="inner">
+      <div class="logo">Ecco Print <span>\u00b7 Beslutningsv\u00e6rkt\u00f8j</span></div>
+      <a href="decision-tool.html" class="active">Beregner</a>
+      <a href="dokumentation.html">Dokumentation</a>
+    </div>
+  </nav>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useMemo, useRef, useEffect } = React;
+
+// ============================================================
+// BUSINESS CENTRAL KONFIGURATION
+// Hardcodet – ingen opsætning nødvendig
+// ============================================================
+const BC = {
+  tenantId:    "6eab21c3-e8c2-4e13-828f-43b9d9725bc2",
+  clientId:    "7127b4d6-1d3b-4b9c-b2f1-22deeb7bff0c",
+  environment: "EP_250305_CN_SANDBOX",
+  companyName: "EP2016",
+  scope:       "https://api.businesscentral.dynamics.com/Financials.ReadWrite.All",
+};
+
+// MSAL instance (singleton)
+let _msalInstance = null;
+async function getMsal() {
+  if (_msalInstance) return _msalInstance;
+  const inst = new msal.PublicClientApplication({
+    auth: {
+      clientId: BC.clientId,
+      authority: `https://login.microsoftonline.com/${BC.tenantId}`,
+      redirectUri: window.location.origin + window.location.pathname,
+    },
+    cache: { cacheLocation: "localStorage", storeAuthStateInCookie: false },
+  });
+  await inst.initialize();
+  _msalInstance = inst;
+  return inst;
+}
+
+async function getToken() {
+  const inst = await getMsal();
+  const accounts = inst.getAllAccounts();
+  if (accounts.length > 0) {
+    try {
+      const r = await inst.acquireTokenSilent({ scopes: [BC.scope], account: accounts[0] });
+      return { token: r.accessToken, username: accounts[0].username };
+    } catch (_) {}
+  }
+  const r = await inst.loginPopup({ scopes: [BC.scope] });
+  return { token: r.accessToken, username: r.account.username };
+}
+
+async function bcGet(path, token) {
+  const res = await fetch(`https://api.businesscentral.dynamics.com/v2.0/${BC.tenantId}/${BC.environment}/api/v2.0${path}`, {
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+  });
+  if (!res.ok) { const j=await res.json().catch(()=>{}); throw new Error(j?.error?.message||`HTTP ${res.status}`); }
+  return res.json();
+}
+
+async function bcPost(path, token, body) {
+  const res = await fetch(`https://api.businesscentral.dynamics.com/v2.0/${BC.tenantId}/${BC.environment}/api/v2.0${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) { const j=await res.json().catch(()=>{}); throw new Error(j?.error?.message||`HTTP ${res.status}`); }
+  return res.status===204 ? null : res.json();
+}
+
+// Hent company GUID for EP2016 én gang og cache det
+let _companyId = null;
+async function getCompanyId(token) {
+  if (_companyId) return _companyId;
+  const data = await bcGet(`/companies?$filter=name eq '${BC.companyName}'`, token);
+  if (!data.value?.length) throw new Error(`Kunne ikke finde virksomhed '${BC.companyName}' i BC`);
+  _companyId = data.value[0].id;
+  return _companyId;
+}
+
+// Web2PV API POST
+async function pvPost(path, token, body) {
+  const companyId = await getCompanyId(token);
+  const url = `https://api.businesscentral.dynamics.com/v2.0/${BC.tenantId}/${BC.environment}/api/printvis/web2pvs/v2.0/companies(${companyId})${path}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) { const j=await res.json().catch(()=>{}); throw new Error(j?.error?.message||`HTTP ${res.status}`); }
+  return res.json();
+}
+
+// Vælg Product Group baseret på finish
+function getProductGroup(finish) {
+  if (finish === "lam_blank" || finish === "lam_mat") return "130"; // Digital m/laminat
+  if (finish === "lak_blank" || finish === "lak_mat") return "110"; // Digital m/lak
+  return "100"; // Digital u/lak
+}
+
+// ============================================================
+// BC TILBUDS-MODAL
+// ============================================================
+function BCQuoteModal({ result, inputs, onConfirm, onClose, isLoading, errorMsg }) {
+  const [custNo, setCustNo] = React.useState("");
+  const [extRef, setExtRef]  = React.useState("");
+  const rec = result?.rec?.lvl === "digital" ? "⚡ Digital (HP Indigo)"
+            : result?.rec?.lvl === "flexo"   ? "🔄 Flexo (BOBST M5)"
+            :                                  "⚖️ Tæt på – overvej begge";
+  const IL = { width:"100%", padding:"9px 12px", borderRadius:7, border:"1.5px solid #d1d5db", fontSize:14, background:"#fff", outline:"none", boxSizing:"border-box" };
+  const LL = { fontSize:11, fontWeight:700, color:"#4b5563", marginBottom:4, display:"block", letterSpacing:"0.05em", textTransform:"uppercase" };
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}}>
+      <div style={{background:"#fff",borderRadius:16,padding:28,width:460,maxWidth:"95vw",boxShadow:"0 24px 64px rgba(0,0,0,0.25)"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:18}}>
+          <div style={{fontSize:16,fontWeight:800,color:"#1f2937"}}>📋 Opret tilbud i Business Central</div>
+          <button onClick={onClose} style={{background:"none",border:"none",cursor:"pointer",fontSize:22,color:"#9ca3af",lineHeight:1}}>×</button>
+        </div>
+
+        {/* Opsummering fra tool'et */}
+        <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:10,padding:"12px 14px",marginBottom:18,fontSize:12,color:"#374151",lineHeight:1.8}}>
+          <div style={{fontWeight:700,marginBottom:2,fontSize:13}}>{rec}</div>
+          <div>{inputs.qty.toLocaleString("da-DK")} stk &nbsp;·&nbsp; {inputs.w}×{inputs.h} mm &nbsp;·&nbsp; {inputs.colors} farve{inputs.colors!==1?"r":""}</div>
+          <div>Materiale: <b>{inputs.matId}</b> &nbsp;·&nbsp; {inputs.finishName}</div>
+          {result?.d && <div style={{color:"#059669"}}>Digital: <b>{result.d.total.toLocaleString("da-DK",{maximumFractionDigits:0})} kr</b></div>}
+          {result?.f && <div style={{color:"#2563eb"}}>Flexo: <b>{result.f.total.toLocaleString("da-DK",{maximumFractionDigits:0})} kr</b>{result.f.kliche>0?<span style={{color:"#92400e",fontWeight:400}}> (heraf klichéer: {result.f.kliche.toLocaleString("da-DK",{maximumFractionDigits:0})} kr)</span>:""}</div>}
+        </div>
+
+        <div style={{display:"flex",flexDirection:"column",gap:12,marginBottom:16}}>
+          <div>
+            <label style={LL}>Kundenr. i BC <span style={{color:"#dc2626"}}>*</span></label>
+            <input style={IL} value={custNo} onChange={e=>setCustNo(e.target.value)} placeholder="F.eks. K00010" autoFocus/>
+          </div>
+          <div>
+            <label style={LL}>Ekstern reference / Jobnavn (valgfrit)</label>
+            <input style={IL} value={extRef} onChange={e=>setExtRef(e.target.value)} placeholder="F.eks. kundens ordrenr. eller beskrivelse"/>
+          </div>
+        </div>
+
+        {errorMsg && <div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:8,padding:"10px 12px",marginBottom:12,fontSize:13,color:"#991b1b"}}>⚠️ {errorMsg}</div>}
+
+        <div style={{display:"flex",gap:10}}>
+          <button
+            onClick={()=>onConfirm(custNo.trim(), extRef.trim())}
+            disabled={!custNo.trim()||isLoading}
+            style={{flex:1,padding:"11px 0",background:(!custNo.trim()||isLoading)?"#e5e7eb":"#0078d4",color:(!custNo.trim()||isLoading)?"#9ca3af":"#fff",border:"none",borderRadius:8,cursor:(!custNo.trim()||isLoading)?"not-allowed":"pointer",fontSize:14,fontWeight:700,transition:"background 0.15s"}}>
+            {isLoading ? "⏳ Opretter tilbud..." : "Opret tilbud →"}
+          </button>
+          <button onClick={onClose} disabled={isLoading} style={{padding:"11px 18px",background:"none",border:"1px solid #d1d5db",borderRadius:8,cursor:"pointer",fontSize:14,color:"#6b7280"}}>Annuller</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+
+// ============================================================
+// MATERIAL DATA (Flexo Excel June 2025)
+// [id, name, priceLbm, width, priceM2]
+// ============================================================
+const RAW = [
+  ["34376-330","THERMAL BOARD TOP 170",3.72485,330,11.29],
+  ["8207314-330","Jetlaser-FSC RPA4 Kraft Special 55",1.42728,330,4.33],
+  ["8219294-330","FLUOR RED-FSC/RP51/HG65 SPECIAL",2.5182,330,7.63],
+  ["8244425-330","THERMAL TOP P 200-FSC/RR21/HG65 STANDARD PAPER",1.10033,330,3.33],
+  ["8276495-330","THERMAL TOP P 180-FSC/RP45LW/HG65",2.8749,330,8.71],
+  ["8279922-230","Raflacoat Plus FSC RH9X Proliner PLUS  230 mm",1.10033,230,4.78],
+  ["8279922-330","Raflacoat Plus FSC RH9X Proliner PLUS  330 mm",1.57873,330,4.78],
+  ["8303641-330","SYNTHERMAL P200 RH9X Honey Glassine 65",4.05773,330,12.3],
+  ["8387283-330","ANTIQUE WH WSA IL-FSC/RP30/WG85 SPECIAL",3.35097,330,10.15],
+  ["8450017-330","SYNTHERMAL WHITE PP 90/RH1/HONEY GLASSINE 65-FSC",3.61906,330,10.97],
+  ["8450017-370","SYNTHERMAL WHITE PP 90/RH1/HONEY GLASSINE 65-FSC",4.05773,370,10.97],
+  ["8450017-430","SYNTHERMAL WHITE PP 90/RH1/HONEY GLASSINE 65-FSC",4.71575,430,10.97],
+  ["8460481-330","THERMAL TOP P 200 TPFREE-FSC/RH1/HG65-FSC",1.80388,330,5.47],
+  ["8460528-250","THERMAL TOP P 200 TPFREE-FSC/RP48/HG65-FSC",1.37651,250,5.51],
+  ["8460528-330","THERMAL TOP P 200 TPFREE-FSC/RP48/HG65-FSC",1.81699,330,5.51],
+  ["8460566-330","TH TOP P 200 TPFREE-FSC/RR21/HONEY GLASSINE 65-FSC",2.2491,330,6.82],
+  ["8464243-430","RAFLACOAT PLUS-FSC RP51 HONEY GLASSINE 65-FSC",2.12076,430,4.93],
+  ["AB145-330","PP NG TOP CLEAR C2075N-BG40WH FSC",2.95673,330,8.96],
+  ["AC314-330","PP TOP WHITE UVR145-HF80",6.37461,330,19.32],
+  ["AC549-330","PP NG TOP CLEAR S445N-BG45WH FSC",4.68692,330,14.2],
+  ["AC628-330","THERMAL PP100  S2045N-BG40BR",3.5994,330,10.91],
+  ["AD206-330","THERMAL PP100 Top White C2075N-BG40BR",1.5755,330,4.77],
+  ["AE165-330","PP TOP WHITE R5000N-BG40WH",2.76233,330,8.37],
+  ["AE165-370","FIKTIV - PP TOP WHITE R5000N-BG40WH",3.09716,370,8.37],
+  ["AE165-400","FIKTIV - PP TOP WHITE R5000N-BG40WH",3.34828,400,8.37],
+  ["AE165-430","PP TOP WHITE R5000N-BG40WH",3.5994,430,8.37],
+  ["AE403-250","PP TOP WHITE S692N-BG40WH",1.5755,250,6.3],
+  ["AE403-330","PP TOP WHITE S692N-BG40WH",2.07966,330,6.3],
+  ["AE403-370","FIKTIV - PP TOP WHITE S692N-BG40WH",2.33174,370,6.3],
+  ["AE403-400","FIKTIV - PP TOP WHITE S692N-BG40WH",2.5208,400,6.3],
+  ["AE403-430","PP TOP WHITE S692N-BG40WH",2.70986,430,6.3],
+  ["AE404-330","PP TOP CLEAR S692N-BG40WH",2.04485,330,6.2],
+  ["AE404-370","FIKTIV - PP TOP CLEAR S692N-BG40WH",2.29271,370,6.2],
+  ["AE404-400","FIKTIV - PP TOP CLEAR S692N-BG40WH",2.4786,400,6.2],
+  ["AE404-430","PP TOP CLEAR S692N-BG40WH",2.6645,430,6.2],
+  ["AF186-330","PE85 TOP WHITE S692N-BG40WH",2.07378,330,6.28],
+  ["AF207-330","TUFF S445N-BG40BR",6.40264,330,19.4],
+  ["AF588-330","rMC PRIMECOAT FSC S445N-rBG40BR FSC",2.54713,330,7.72],
+  ["AF812-330","PP NG TOP WHITE C2075N-BG40WH FSC",2.98883,330,9.06],
+  ["AF855-330","THERMAL PP75 Top White S445N-BG40BR",6.55861,330,19.87],
+  ["AI454-330","MP PLUS GOLD FSC S2045N-BG40BR",3.3681,330,10.21],
+  ["AL326-330","MP PLUS SILVER FSC S2045N-BG40BR IMP",3.1534,330,9.56],
+  ["AL597-330","PP60 TOP WHITE S692N-BG40WH FSC",1.80388,330,5.47],
+  ["AN073-330","PP40 CAVIT WHITE S692N-BG40WH FSC",1.60948,330,4.88],
+  ["AN319-320","SELFWOUND PP19 CL LOW",1.21086,320,3.78],
+  ["AN319-325","SELFWOUND PP19 CL LOW",1.22978,325,3.78],
+  ["AN321-320","SELFWOUND PP 25 CL MT",2.02848,320,6.34],
+  ["AN321-325","SELFWOUND PP 25 CL MT",2.06017,325,6.34],
+  ["AU000-333","COATED CARD135 FSCS2045N-BG40WH FSC",3.01099,333,9.04],
+  ["AU472-330","PP TOP CLEAR R5000N-BG40WH FSC",2.81523,330,8.53],
+  ["AX150-250","PP60 TOP CLEAR S4000N-rPET30",1.80737,250,7.23],
+  ["AX150-330","PP60 TOP CLEAR S4000N-rPET30",2.38573,330,7.23],
+  ["AY926-330","MP PLUS GOLD FSC S2000N-BG40BR",1.21352,330,3.68],
+  ["AZ600-333","LCJ SUPREME FSC S2012HTC-HF55",1.53743,333,4.62],
+  ["BC679-330","TRANSFER VELLUM FSC S2000NG-BG40BR",1.23378,330,3.74],
+  ["BD997-330","PP TOP WHITE C3NF-BG40WH FSC",3.52638,330,10.69],
+  ["BE250-333","LASERCOPY PP100 MT WH S3100 INC-HF125 FSC",9.37375,333,28.15],
+  ["BJ337-330","RADIANT ORANGE FSC S2000NG-BG40BR",2.57471,330,7.8],
+  ["BJ473-330","Thermal PP Top Clear S692N-BG40WH FSC",2.39528,330,7.26],
+  ["BJ993-333","MC FSC S2000NG-BG40BR",1.21352,333,3.64],
+  ["BL251-330","MC90 OPQ FSC S2660-BG40BR IMP",3.23704,330,9.81],
+  ["BM312-330","Thermal ECO BPA Free FSC S2045N-BG40BR",1.36173,330,4.13],
+  ["BS770-330","THERM 200HD PLUS NP FSC S2045N-BG40BR - SLEEVES",1.83824,330,5.57],
+  ["BS770-370","THERM 200HD PLUS NP FSC S2045N-BG40BR - SLEEVES",2.06106,370,5.57],
+  ["BS770-400","FIKTIV - THERM 200HD PLUS NP FSC S2045N-BG40BR",2.22817,400,5.57],
+  ["BS770-430","THERM 200HD PLUS NP FSC S2045N-BG40BR - SLEEVES",2.39528,430,5.57],
+  ["BT024-330","rCRUSH BARLEY FSC S2030-BG45WH FSC",4.26149,330,12.91],
+  ["BT618-250","rMC FSC R5000N-rBG40BR FSC",1.19875,250,4.79],
+  ["BT618-333","rMC FSC R5000N-rBG40BR FSC",1.59674,333,4.79],
+  ["BT618-370","rMC FSC R5000N-rBG40BR FSC",1.77415,370,4.79],
+  ["BT618-400","rMC FSC R5000N-rBG40BR FSC",1.918,400,4.79],
+  ["BT618-430","rMC FSC R5000N-rBG40BR FSC",2.06185,430,4.79],
+  ["BU294-330","THERM 200HD PLUS NP FSC C2075N-BG40BR",2.33826,330,7.09],
+  ["BU294-370","FIKTIV - THERM 200HD PLUS NP FSC C2075N-BG40BR",2.62169,370,7.09],
+  ["BU294-400","FIKTIV - THERM 200HD PLUS NP FSC C2075N-BG40BR",2.83426,400,7.09],
+  ["BU294-430","FIKTIV - THERM 200HD PLUS NP FSC C2075N-BG40BR",3.04683,430,7.09],
+  ["BU296-330","THERMAL 200HD FSC R5000N-BG40BR",2.45129,330,7.43],
+  ["BU296-370","FIKTIV - THERMAL 200HD FSC R5000N-BG40BR",2.74841,370,7.43],
+  ["BU296-400","FIKTIV - THERMAL 200HD FSC R5000N-BG40BR",2.97126,400,7.43],
+  ["BU296-430","FIKTIV - THERMAL 200HD FSC R5000N-BG40BR",3.1941,430,7.43],
+  ["BU925-330","TRANSFER VELLUM FSC S2046-BG40BR",1.27131,330,3.85],
+  ["BV338-330","MC Premium FSC S2045N-BG40BR",1.58461,330,4.8],
+  ["BV407-330","PP50 TOP SILVER S692N-BG40WH FSC",2.92192,330,8.85],
+  ["BV407-370","FIKTIV - PP50 TOP SILVER S692N-BG40WH FSC",3.27609,370,8.85],
+  ["BV407-400","FIKTIV - PP50 TOP SILVER S692N-BG40WH FSC",3.54172,400,8.85],
+  ["BV407-430","FIKTIV - PP50 TOP SILVER S692N-BG40WH FSC",3.80735,430,8.85],
+  ["BW890-330","SYNTHETIC PAPER160 XS C3NF-BG50WH FSC",5.72042,330,17.33],
+  ["BX248-330","PP NG TOP WHITE S2045N-BG40WH FSC",2.36448,330,7.17],
+  ["BZ210-330","THERMAL 200NG/F FSC S2045N-BG30BR FSC",1.6895,330,5.12],
+  ["CF568-325","PP CL 1S-17 SOFT TOUCH",1.72579,325,5.31],
+  ["CF774-333","MC FSC S2080-BG40BR",1.35722,333,4.08],
+  ["CG515-250","rMC FSC S2045N-rBG40BR FSC",0.911,250,3.64],
+  ["CG515-330","rMC FSC S2045N-rBG40BR FSC",1.20259,330,3.64],
+  ["CG515-370","FIKTIV - rMC FSC S2045N-rBG40BR FSC",1.34835,370,3.64],
+  ["CG515-400","FIKTIV - rMC FSC S2045N-rBG40BR FSC",1.45768,400,3.64],
+  ["CG515-430","rMC FSC S2045N-rBG40BR FSC",1.56701,430,3.64],
+  ["CG515MATGULD-330","FORTRYKT MAT GULD rMC FSC S2045N-BG40BR",1.75279,330,5.31],
+  ["CH990-330","CLEANFLAKE PP50 WHITE S7000ER-BG40WH FSC",1.78625,330,5.41],
+  ["CK618-330","TRANSFER VELLUM FSC R5000N-BG40BR",1.62213,330,4.92],
+  ["CK891-330","THERMAL 200GP NP FSC S2045N-BG40BR",1.71436,330,5.2],
+  ["CK891-370","THERMAL 200GP NP FSC S2045N-BG40BR",1.92216,370,5.2],
+  ["CK891-400","THERMAL 200GP NP FSC S2045N-BG40BR",2.07802,400,5.2],
+  ["CK891-430","THERMAL 200GP NP FSC S2045N-BG40BR",2.23387,430,5.2],
+  ["CL427-330","rMC Primecoat Plus FSC F1 BG40WH FSC",5.24752,330,15.9],
+  ["CM259-330","VERGE BLANC NEW FSC S2047N-BG45WH IMP FSC",2.90791,330,8.81],
+  ["CO111-330","rMC Primecoat Plus FSC F1 BG40WH FSC",4.23454,330,12.83],
+  ["CO115-330","rMC FSC C2075N-BG40BR FSC",1.75279,330,5.31],
+  ["CO115-370","FIKTIV - rMC FSC C2075N-BG40BR FSC",1.96525,370,5.31],
+  ["CO115-400","rMC FSC C2075N-BG40BR FSC",2.1246,400,5.31],
+  ["CO115-430","FIKTIV - rMC FSC C2075N-BG40BR FSC",2.28394,430,5.31],
+  ["CO115MATGULD-330","FORTRYKT MAT GULD rMC FSC C2075N-BG40BR FSC",3.93,330,11.91],
+  ["CP243-330","THERMAL 200RDX/F NP FSC S2045N-BG40BR FSC",1.6895,330,5.12],
+  ["EC166-250","PET36 MATT SILVER MP312N-BG50WH",9.12,250,36.48],
+  ["EC166-330","PET36 MATT SILVER MP312N-BG50WH",12.038,330,36.48],
+  ["EC218-220","PVC GLOSS WHITE MP312N-BG50WH",4.669,220,21.22],
+  ["FIKTIV-250","Fiktiv materiale bredde 250 mm - HUSK pris",2.33955,250,9.36],
+  ["FIKTIV-330","Fiktiv materiale bredde 330 mm - HUSK pris",3.0882,330,9.36],
+  ["FIKTIV-370","Fiktiv materiale bredde 370 mm - HUSK pris",3.46253,370,9.36],
+  ["FIKTIV-400","Fiktiv materiale bredde 400 mm - HUSK pris",3.74328,400,9.36],
+  ["FIKTIV-430","Fiktiv materiale bredde 430 mm - HUSK pris",4.02402,430,9.36],
+  ["LB392-330","VERGE BLANC FSC R5000N-BG40WH FSC",3.43325,330,10.4],
+  ["MUS20-333","MUS 20my MAT, 333 mm",0.43467,333,1.31],
+  ["PJ106200/1220","GTS Perm Sølv sati",1.895,305,6.21],
+  ["PJ13101275","Alufin KPW Sølv",0.859,305,2.82],
+  ["PJ13101509-305","Luxor KPW 220 Guld",0.859,305,2.82],
+  ["PJ13116236-305","Alufin MTH Sølv",1.376,305,4.51],
+  ["PJ13116439-305","Alufin MTH Sølv Satin Gloss",1.402,305,4.6],
+  ["PJ13117967","Luxor MTH 362 sort",2.032,305,6.66],
+  ["AA002-330","MC PRIMECOAT FSC S451-BG40BR IMP",2.79398,330,8.47],
+  ["AA018-330","VELLUM EXTRA FSC UR400-BG40BR IMP",4.19639,330,12.72],
+  ["AA018-333","VELLUM EXTRA FSC UR400-BG40BR IMP",4.23454,333,12.72],
+];
+
+const MATERIALS = RAW.map(([id,name,priceLbm,width,priceM2]) => ({ id,name,priceLbm,width,priceM2 }));
+
+function getBaseId(id) {
+  const p = id.replace(/\//g,"_").split("-");
+  const last = p[p.length-1];
+  if (/^\d{3,4}$/.test(last) && +last >= 200 && +last <= 500) return p.slice(0,-1).join("-");
+  return id;
+}
+
+const DIGI_MAX_MEDIA = 333;
+const DIGI_PRINT_W = 316;
+
+function findDigitalVariant(mat) {
+  if (mat.width <= DIGI_MAX_MEDIA) return mat;
+  const base = getBaseId(mat.id);
+  const vs = MATERIALS.filter(m => getBaseId(m.id) === base && m.width <= DIGI_MAX_MEDIA);
+  return vs.length ? vs.reduce((a,b) => b.width > a.width ? b : a, vs[0]) : null;
+}
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+const DIG = {
+  gap:3,
+  startup:{0:612,1:1704,4:1704}, // Neutral vs Trykte (uden fragt/webrabat)
+  // Print+diecut rate: [<600m, 600-999m, ≥1000m]
+  printRate:{0:[2.0882,2.0882,2.0882], 1:[2.97,3.04,2.96], 4:[3.89,3.94,3.83]},
+  // Color surcharge per meter (separate line)
+  colorRate:{0:0, 1:0.177, 4:1.394},
+  // Die/stans cost by shape
+  die:{rectangle:0, round:0, bespoke:600},
+  lakBlank:0.156, lakMat:0.344,
+  lamOpstart:370, lamBlank:0.73848, lamMat:1.7748,
+  // Rollshift cost per shift: across → [<600m, 600-999m, ≥1000m]
+  rollshift:{
+    1:[17.77,17.43,16.89], 2:[45.75,44.88,43.50], 3:[45.75,39.89,38.67],
+    4:[36.60,35.90,34.80], 5:[33.04,32.41,31.42], 6:[30.50,29.92,29.00],
+    7:[27.96,27.42,26.58], 8:[25.93,25.43,24.65], 9:[24.40,23.93,23.20],
+    10:[22.88,22.44,21.75],
+  },
+};
+
+const FLX = {
+  kanter:16, gapAcross:3, minGap:2,
+  sleeves:[96,100,104,108,111,114,117,120,124,128,132,148],
+  pitch:3.175, printSpeed:100,
+  R:{ op:800, bobstS:2500, bobstT:7500, omS:800, omT:1800 },
+  inkG:0.5, inkKr:274,
+  lakKr:{blank:123,mat:263.5}, lakG:2,
+  klicheKr:750,
+  limG:3, limKr:349.35,
+};
+
+const FINISHES = [
+  {id:"none",name:"Ingen efterbehandling"},
+  {id:"lak_blank",name:"Lak blank"},
+  {id:"lak_mat",name:"Lak mat"},
+  {id:"lam_blank",name:"Laminat blank"},
+  {id:"lam_mat",name:"Laminat mat"},
+];
+
+// ============================================================
+// DIGITAL CALCULATION
+// ============================================================
+// TODO: Vendesløjfe og limdræber bruger flexo-priser indtil digital-priser er verificeret
+function calcDigital(qty, w, h, colors, flexoMat, finish, orient, perRoll, shape, vende, limd) {
+  const dm = findDigitalVariant(flexoMat);
+  if (!dm) return null;
+  const G=DIG.gap, PW=DIGI_PRINT_W;
+  const aW = Math.floor(PW/(w+G)), aH = Math.floor(PW/(h+G));
+  if (aW<1 && aH<1) return null;
+
+  // Plain division like Excel (no ceil)
+  const mW = aW>0 ? qty/aW*(h+G)/1000 : Infinity;
+  const mH = aH>0 ? qty/aH*(w+G)/1000 : Infinity;
+  let across, prodM, orientUsed;
+  if (orient==="w_across") {
+    if (aW<1) return null;
+    across=aW; prodM=mW; orientUsed="w_across";
+  } else if (orient==="h_across") {
+    if (aH<1) return null;
+    across=aH; prodM=mH; orientUsed="h_across";
+  } else {
+    if (mW<=mH) { across=aW; prodM=mW; orientUsed="w_across"; }
+    else { across=aH; prodM=mH; orientUsed="h_across"; }
+  }
+
+  const ck = colors>=4?4:colors>=1?1:0;
+  const mb = prodM<600?0:prodM<1000?1:2; // meter bracket
+  const startup = DIG.startup[ck];
+  const print = prodM * DIG.printRate[ck][mb];
+  const colorCost = prodM * DIG.colorRate[ck];
+  const mat = prodM * dm.priceM2 * (dm.width/1000);
+  const die = DIG.die[shape] || 0;
+
+  let fin=0;
+  if (finish==="lak_blank") fin=prodM*DIG.lakBlank;
+  else if (finish==="lak_mat") fin=prodM*DIG.lakMat;
+  else if (finish==="lam_blank") fin=DIG.lamOpstart+prodM*DIG.lamBlank;
+  else if (finish==="lam_mat") fin=DIG.lamOpstart+prodM*DIG.lamMat;
+
+  // Limdræber: bruger flexo-priser (FLX.limG, FLX.limKr) som placeholder
+  let limMat=0;
+  if (limd) {
+    const areaM = prodM * (dm.width/1000);
+    limMat = (areaM * FLX.limG / 1000) * FLX.limKr;
+  }
+
+  // Vendesløjfe: bruger flexo-tidspris som placeholder (20 min × BOBST rate)
+  const vendeCost = vende ? (20/60)*FLX.R.bobstS : 0;
+
+  const nR = Math.ceil(qty / perRoll);
+  const rsAcross = Math.min(Math.max(across,1),10);
+  const rsCost = DIG.rollshift[rsAcross][mb];
+  const rs = Math.max(0,nR-1)*rsCost;
+  const labelAcross = orientUsed==="w_across" ? w : h;
+  const util = Math.round(across * labelAcross / dm.width * 100);
+  const total = startup+print+colorCost+mat+die+fin+vendeCost+limMat+rs;
+
+  return {
+    total, perLabel:total/qty, across, meters:prodM,
+    matId:dm.id, matW:dm.width, diffMat:dm.id!==flexoMat.id,
+    numRolls:nR, orientUsed, util,
+    bd:{opstart:startup, tryk:print, farve:colorCost, materiale:mat, stans:die, efterbehandling:fin, vendesløjfe:vendeCost, limdræber:limMat, rulleskift:rs},
+  };
+}
+
+// ============================================================
+// FLEXO CALCULATION (matches Excel exactly)
+// ============================================================
+function calcFlexo(qty, w, h, colors, mat, finish, nKliche, vende, limd, perRoll, orient) {
+  const fw=mat.width, avail=fw-FLX.kanter;
+
+  // Try one or both orientations
+  const orientations = orient==="auto" ? ["w_across","h_across"] : [orient];
+  let bestLayout = null;
+
+  for (const ori of orientations) {
+    const wA = ori==="w_across" ? w : h; // dimension across web
+    const hA = ori==="w_across" ? h : w; // dimension along web (around sleeve)
+    const ac = Math.floor(avail/(wA+FLX.gapAcross));
+    if (ac<1) continue;
+
+    for (const Z of FLX.sleeves) {
+      const circ=Z*FLX.pitch;
+      const ar=Math.floor(circ/(hA+FLX.minGap));
+      if (ar<1) continue;
+      if (circ/ar-hA < FLX.minGap-0.01) continue;
+      const pr=ac*ar, revs=Math.ceil(qty/pr), m=(revs*circ)/1000;
+      if (!bestLayout||m<bestLayout.m) bestLayout={Z,ar,m,circ,pr,across:ac,orientUsed:ori,wAcross:wA,hAlong:hA,labelPitch:circ/ar};
+    }
+  }
+  if (!bestLayout) return null;
+
+  const {across} = bestLayout;
+  const prodM = bestLayout.m;
+  const setupM = 10 + 5*Math.max(colors,1);
+  const totalM = prodM + setupM;
+  const R = FLX.R;
+
+  // === MATERIALER ===
+  const papir = totalM * mat.priceLbm;
+
+  // Ink & lak on PRODUCTION meters only
+  const areaProd = prodM * (fw/1000);
+  const inkKg = areaProd * FLX.inkG * colors / 1000;
+  const ink = inkKg * FLX.inkKr;
+
+  let lak=0;
+  if (finish!=="lam_blank" && finish!=="lam_mat") {
+    const lp = finish==="lak_mat" ? FLX.lakKr.mat : FLX.lakKr.blank;
+    lak = (areaProd * FLX.lakG / 1000) * lp;
+  }
+
+  let lam=0;
+  if (finish==="lam_blank"||finish==="lam_mat") lam=totalM*1.5;
+
+  // Limdræber on TOTAL meters
+  let limMat=0;
+  if (limd) {
+    const areaTotal = totalM * (fw/1000);
+    limMat = (areaTotal * FLX.limG / 1000) * FLX.limKr;
+  }
+
+  const matTotal = papir+ink+lak+lam+limMat;
+
+  // === TIMER ===
+  const opstart = (5/60)*R.op;
+  const klicM = colors>0 ? (3*colors/60)*R.op : 0;
+  const klicA = colors>0 ? (3*colors/60)*R.op : 0;
+  const bPapir = (5/60)*R.bobstS;
+  const bKlic = colors>0 ? (3*colors/60)*R.bobstS : 0;
+  const bStans = (5/60)*R.bobstS;
+  const bVende = vende ? (20/60)*R.bobstS : 0;
+  const bLimd = limd ? (9/60)*R.bobstS : 0;
+  const bIndk = (8/60)*R.bobstS;
+  const setupCost = opstart+klicM+klicA+bPapir+bKlic+bStans+bVende+bLimd+bIndk;
+
+  // Bobst maskintid (total meters)
+  const printMin = totalM / FLX.printSpeed;
+  const bobstTryk = (printMin/60)*R.bobstT;
+
+  // Omega
+  const omPapir = (5/60)*R.omS;
+  const knives = across+1;
+  const omKnive = (0.5*knives/60)*R.omS;
+  const omTryk = (printMin/60)*R.omT;
+  const numRolls = Math.ceil(qty/perRoll);
+  const omRS = (0.5*(numRolls/across)/60)*R.omT;
+  const omTotal = omPapir+omKnive+omTryk+omRS;
+
+  const timerTotal = setupCost+bobstTryk+omTotal;
+
+  // Klichéer (separat)
+  const kliche = nKliche * FLX.klicheKr;
+
+  const baseTotal = matTotal+timerTotal;
+  const total = baseTotal+kliche;
+
+  const util = Math.round(across * bestLayout.wAcross / fw * 100);
+
+  return {
+    total, baseTotal, kliche, perLabel:total/qty,
+    across, around:bestLayout.ar, Z:bestLayout.Z, meters:totalM, fw,
+    numRolls, labelsPerRoll:perRoll, orientUsed:bestLayout.orientUsed,
+    labelPitch:bestLayout.labelPitch, gapAround:bestLayout.labelPitch-bestLayout.hAlong,
+    util,
+    bd:{
+      opsætning:setupCost, "bobst tryk":bobstTryk, skæring:omTotal,
+      papir, trykfarve:ink, lak, laminat:lam, limdræber:limMat,
+    },
+  };
+}
+
+// ============================================================
+// RECOMMENDATION
+// ============================================================
+function getRec(d, f, pantone, haster, nKliche) {
+  if (!d&&!f) return {lvl:"error",conf:"none",diff:0};
+  if (!f) return {lvl:"digital",conf:"high",diff:100};
+  if (!d) return {lvl:"flexo",conf:"high",diff:-100};
+  const diff = ((f.total-d.total)/Math.min(d.total,f.total))*100;
+
+  // Pantone overrules price if digital would win
+  if (pantone && diff>0) {
+    // Digital is cheaper but pantone required → shift toward flexo
+    if (diff<15) return {lvl:"flexo",conf:"medium",diff:-diff,override:"pantone"};
+    return {lvl:"tæt",conf:"low",diff,override:"pantone"};
+  }
+
+  // Haster + nyt job → shift toward digital
+  if (haster && nKliche>0 && diff<0 && diff>-15) {
+    return {lvl:"tæt",conf:"low",diff,override:"haster"};
+  }
+
+  if (diff>25) return {lvl:"digital",conf:"high",diff};
+  if (diff>10) return {lvl:"digital",conf:"medium",diff};
+  if (diff>-10) return {lvl:"tæt",conf:"low",diff};
+  if (diff>-25) return {lvl:"flexo",conf:"medium",diff};
+  return {lvl:"flexo",conf:"high",diff};
+}
+
+function getExpl(rec, d, f, colors, qty, nKliche, pantone, haster, cross, mat, ordreType) {
+  const L=[];
+  if (!d&&!f) { L.push({icon:"⚠️",cat:"fejl",txt:"Etiketformatet er for stort til begge maskiner."}); return L; }
+  if (!d) { L.push({icon:"⚠️",cat:"fejl",txt:"Materialet fås ikke i en bredde til HP Indigo (max 333 mm). Kun flexo er mulig."}); return L; }
+  if (!f) { L.push({icon:"⚠️",cat:"fejl",txt:"Etiketten er for stor til BOBSTs trykcylindre. Kun digital er mulig."}); return L; }
+  const pct=Math.abs(rec.diff).toFixed(0), kr=Math.abs(d.total-f.total).toFixed(0);
+  const fN=v=>v.toLocaleString("da-DK");
+
+  // === 1. Prisforskel ===
+  if (d.total<f.total) {
+    L.push({icon:"💰",cat:"pris",txt:`Digital er ca. ${pct}% billigere (${fN(+kr)} kr i forskel).`});
+  } else if (f.total<d.total) {
+    L.push({icon:"💰",cat:"pris",txt:`Flexo er ca. ${pct}% billigere (${fN(+kr)} kr i forskel).`});
+  } else {
+    L.push({icon:"💰",cat:"pris",txt:"Priserne er næsten ens."});
+  }
+
+  // === 2. Nær break-even ===
+  if (cross) {
+    const distPct = Math.abs(qty - cross) / cross * 100;
+    if (distPct < 25) {
+      if (qty < cross) {
+        L.push({icon:"📊",cat:"break-even",txt:`Ved ${fN(cross)} stk bliver flexo billigere end digital. Kunden er tæt på – måske kan oplaget øges lidt?`});
+      } else {
+        L.push({icon:"📊",cat:"break-even",txt:`Under ${fN(cross)} stk ville digital have været billigst. Kunden ligger lige over grænsen.`});
+      }
+    }
+  }
+
+  // === 3. Klichéer (kun når det påvirker beslutningen) ===
+  const absPct = Math.abs(rec.diff);
+  if (nKliche > 0 && f.kliche > 0) {
+    const klichePct = Math.round(f.kliche / f.total * 100);
+    const flexoUdenKliche = f.total - f.kliche;
+
+    if (f.total <= d.total) {
+      // Flexo er billigst trods klichéer – nævn det kort
+      L.push({icon:"🔧",cat:"kliché",txt:`Selv med ${nKliche} nye kliché${nKliche>1?"er":""} til ${fN(f.kliche)} kr er flexo billigst.${nKliche<colors?` Kun ${nKliche} af ${colors} skal skiftes.`:""}`});
+    } else if (absPct < 20) {
+      // Tæt på – klichéer er afgørende for beslutningen
+      if (flexoUdenKliche < d.total) {
+        L.push({icon:"🔧",cat:"kliché",txt:`Klichéer koster ${fN(f.kliche)} kr (${nKliche} stk) – det er det der gør flexo dyrere. Ved genbestilling slipper kunden for dem, og flexo falder til ${fN(Math.round(flexoUdenKliche))} kr.${nKliche<colors?` Kun ${nKliche} af ${colors} skal skiftes.`:""}`});
+      } else {
+        L.push({icon:"🔧",cat:"kliché",txt:`Der skal laves ${nKliche} nye kliché${nKliche>1?"er":""} til ${fN(f.kliche)} kr (${klichePct}% af flexo-prisen).${nKliche<colors?` Kun ${nKliche} af ${colors} skal skiftes.`:""}`});
+      }
+    }
+    // Over 20% forskel: prisen taler for sig selv, vis ikke kliché-info
+  }
+  if (nKliche===0 && f.total<d.total) {
+    L.push({icon:"✅",cat:"kliché",txt:"Klichéerne er allerede lavet – det gør flexo billigere."});
+  }
+
+  // === 4. Dyrt materiale + udnyttelsesforskel ===
+  const utilDiff = Math.abs(f.util - d.util);
+  if (mat.priceM2 >= 8 && utilDiff >= 8) {
+    const better = f.util > d.util ? "Flexo" : "Digital";
+    const worse = f.util > d.util ? "digital" : "flexo";
+    const hi = f.util>d.util?f.util:d.util, lo = f.util>d.util?d.util:f.util;
+    L.push({icon:"🧻",cat:"materiale",txt:`Materialet er dyrt (${fN(Math.round(mat.priceM2*10)/10)} kr/m²). ${better} spilder mindre af banen (${hi}% brugt vs. ${lo}% på ${worse}) – det gør en mærkbar forskel i pris.`});
+  } else if (utilDiff >= 10) {
+    const better = f.util > d.util ? "Flexo" : "Digital";
+    const worse = f.util > d.util ? "digital" : "flexo";
+    const hi = f.util>d.util?f.util:d.util, lo = f.util>d.util?d.util:f.util;
+    L.push({icon:"🧻",cat:"materiale",txt:`${better} bruger ${hi}% af materialebanen, ${worse} kun ${lo}%. Resten er spild.`});
+  }
+
+  // === 5. Farve-kompleksitet vs. oplag (kun når det forklarer noget) ===
+  if (colors >= 4 && qty < 5000 && nKliche > 0 && absPct < 25) {
+    const setupPct = Math.round((f.bd["opsætning"] || 0) / f.total * 100);
+    if (setupPct > 30) {
+      L.push({icon:"🎨",cat:"farver",txt:`Flexo bruger lang tid på at gøre maskinen klar til ${colors} farver – det fylder ${setupPct}% af prisen. Digital har ikke den omkostning.`});
+    }
+  } else if (colors <= 1 && qty > 10000 && f.total < d.total) {
+    L.push({icon:"🎨",cat:"farver",txt:"Kun én farve og mange etiketter – flexo er hurtig klar og billig pr. etiket."});
+  }
+
+  // === 6. Neutral/thermal ===
+  if (colors === 0) {
+    L.push({icon:"🏷️",cat:"thermal",txt:"Etiketten skal ikke trykkes – digital opstart er kun 612 kr. Flexo kræver stadig fuld klargøring."});
+  }
+
+  // === Pantone ===
+  if (pantone) {
+    if (d.total<f.total) {
+      L.push({icon:"⚠️",cat:"kvalitet",txt:"Kunden kræver Pantone-farver. Digital kan ikke ramme dem præcist – overvej flexo selvom det koster mere."});
+    } else {
+      L.push({icon:"✅",cat:"kvalitet",txt:"Kunden kræver Pantone-farver – flexo rammer dem præcist."});
+    }
+  }
+
+  // === Haster ===
+  if (haster && nKliche>0) {
+    L.push({icon:"⚡",cat:"tid",txt:"Jobbet haster, men nye klichéer tager 3–5 dage. Digital kan køre med det samme."});
+  } else if (haster && nKliche===0) {
+    L.push({icon:"⚡",cat:"tid",txt:"Jobbet haster – men klichéerne er klar, så flexo kan også køre hurtigt."});
+  }
+
+  // === Oplag ===
+  if (qty > 15000 && f.total < d.total) {
+    L.push({icon:"📦",cat:"oplag",txt:"Mange etiketter – flexo bliver billigere pr. stk jo flere der trykkes."});
+  }
+
+  // === Layout ===
+  if (d.diffMat) {
+    L.push({icon:"📐",cat:"layout",txt:`Digital bruger ${d.matId} (${d.matW} mm) – smallere variant end flexo.`});
+  }
+
+  return L;
+}
+
+const fmt=n=>(n==null||isNaN(n))?"–":n.toLocaleString("da-DK",{maximumFractionDigits:0}).replace(/\./g," ");
+const fmtD=(n,d=2)=>(n==null||isNaN(n))?"–":n.toLocaleString("da-DK",{minimumFractionDigits:d,maximumFractionDigits:d});
+
+function SearchSelect({options,value,onChange,placeholder}) {
+  const [open,setOpen]=useState(false);
+  const [s,setS]=useState("");
+  const ref=useRef(null);
+  useEffect(()=>{
+    const h=e=>{if(ref.current&&!ref.current.contains(e.target))setOpen(false)};
+    document.addEventListener("mousedown",h); return ()=>document.removeEventListener("mousedown",h);
+  },[]);
+  const fl=options.filter(o=>o.id.toLowerCase().includes(s.toLowerCase())||o.name.toLowerCase().includes(s.toLowerCase()));
+  const sel=options.find(o=>o.id===value);
+  return (
+    <div ref={ref} style={{position:"relative"}}>
+      <div onClick={()=>setOpen(!open)} style={{padding:"10px 14px",borderRadius:8,border:"1.5px solid #d1d5db",fontSize:13,background:"#fff",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",minHeight:42,overflow:"hidden"}}>
+        <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1}}>{sel?`${sel.id} – ${sel.name}`:placeholder}</span>
+        <span style={{fontSize:10,marginLeft:8,color:"#9ca3af",flexShrink:0}}>▼</span>
+      </div>
+      {open&&<div style={{position:"absolute",top:"100%",left:0,right:0,zIndex:50,background:"#fff",border:"1.5px solid #d1d5db",borderRadius:8,marginTop:4,boxShadow:"0 8px 24px rgba(0,0,0,0.12)",maxHeight:320,display:"flex",flexDirection:"column"}}>
+        <input autoFocus placeholder="Søg varenr. eller beskrivelse..." value={s} onChange={e=>setS(e.target.value)} style={{padding:"10px 14px",border:"none",borderBottom:"1px solid #e5e7eb",fontSize:13,outline:"none"}}/>
+        <div style={{overflow:"auto",flex:1}}>
+          {fl.slice(0,50).map(o=><div key={o.id} onClick={()=>{onChange(o.id);setOpen(false);setS("")}} style={{padding:"7px 14px",cursor:"pointer",fontSize:12,lineHeight:1.4,background:o.id===value?"#eff6ff":"transparent",borderLeft:o.id===value?"3px solid #2563eb":"3px solid transparent",display:"flex",justifyContent:"space-between"}} onMouseEnter={e=>{if(o.id!==value)e.currentTarget.style.background="#f3f4f6"}} onMouseLeave={e=>{if(o.id!==value)e.currentTarget.style.background="transparent"}}>
+            <span><b style={{color:"#111"}}>{o.id}</b> <span style={{color:"#6b7280"}}>{o.name}</span></span>
+            <span style={{color:"#9ca3af",fontSize:11,flexShrink:0,marginLeft:8}}>{o.width}mm</span>
+          </div>)}
+          {fl.length===0&&<div style={{padding:14,color:"#9ca3af",fontSize:13}}>Intet fundet</div>}
+        </div>
+      </div>}
+    </div>
+  );
+}
+
+function BreakEvenChart({w,h,colors,mat,finish,orient,perRoll,shape,nKliche,vende,limd,currentQty}) {
+  const data = useMemo(()=>{
+    if (!mat||w<5||h<5) return null;
+    const maxQ = Math.max(50000, currentQty*4);
+    const steps = 80;
+    const pts = [];
+    for (let i=0; i<=steps; i++) {
+      const q = Math.max(200, Math.round(200 + (maxQ-200)*(i/steps)));
+      const d = calcDigital(q,w,h,colors,mat,finish,orient,perRoll,shape,vende,limd);
+      const f = calcFlexo(q,w,h,colors,mat,finish,nKliche,vende,limd,perRoll,orient);
+      pts.push({q, d:d?d.total:null, f:f?f.total:null});
+    }
+    let cross = null;
+    for (let i=1; i<pts.length; i++) {
+      const p=pts[i-1], c=pts[i];
+      if (p.d!=null && p.f!=null && c.d!=null && c.f!=null) {
+        const prevDiff = p.d - p.f;
+        const currDiff = c.d - c.f;
+        if (prevDiff * currDiff < 0) {
+          const t = prevDiff / (prevDiff - currDiff);
+          cross = Math.round(p.q + t * (c.q - p.q));
+          break;
+        }
+      }
+    }
+    return {pts, cross, maxQ};
+  },[w,h,colors,mat,finish,orient,perRoll,shape,nKliche,vende,limd,currentQty]);
+
+  if (!data || data.pts.length<2) return null;
+  const {pts, cross, maxQ} = data;
+
+  const W=520, H=200, pad={t:12,r:16,b:32,l:52};
+  const cW=W-pad.l-pad.r, cH=H-pad.t-pad.b;
+
+  const allVals = pts.flatMap(p=>[p.d,p.f]).filter(v=>v!=null);
+  if (allVals.length<2) return null;
+  const rawMax=Math.max(...allVals);
+
+  // Nice round Y ticks
+  const niceStep=(v)=>{const mag=Math.pow(10,Math.floor(Math.log10(v)));const opts=[1,2,2.5,5,10];for(const o of opts){const s=o*mag;if(v/s<=6)return s;}return mag*10;};
+  const step=niceStep(rawMax);
+  const maxY=Math.ceil(rawMax/step)*step;
+  const yTicks=[];for(let v=0;v<=maxY;v+=step)yTicks.push(v);
+
+  const x=q=>pad.l+(q-200)/(maxQ-200)*cW;
+  const y=v=>pad.t+cH-v/maxY*cH;
+
+  let dPath="", fPath="";
+  pts.forEach(p=>{
+    if (p.d!=null) dPath+=(dPath?"L":"M")+`${x(p.q).toFixed(1)},${y(p.d).toFixed(1)} `;
+    if (p.f!=null) fPath+=(fPath?"L":"M")+`${x(p.q).toFixed(1)},${y(p.f).toFixed(1)} `;
+  });
+
+  const xNice=(max)=>{const mag=Math.pow(10,Math.floor(Math.log10(max/4)));const opts=[1,2,2.5,5,10];for(const o of opts){const s=o*mag;const n=max/s;if(n>=3&&n<=8)return s;}return mag*10;};
+  const xStep = xNice(maxQ);
+  const xTicks=[];for(let v=xStep;v<=maxQ;v+=xStep)xTicks.push(v);
+
+  const fmtK=v=>{if(v>=1000000)return (v/1000000).toFixed(v%1000000===0?0:1)+"M";if(v>=1000)return (v/1000).toFixed(v%1000===0?0:v%500===0?0:1)+"k";return v.toString();};
+  const fmtKr=v=>{if(v===0)return"0";if(v>=10000)return Math.round(v/1000)+"k";return new Intl.NumberFormat("da-DK").format(Math.round(v));};
+
+  let crossY=null;
+  if(cross){const cd=calcDigital(cross,w,h,colors,mat,finish,orient,perRoll,shape,vende,limd);if(cd)crossY=y(cd.total);}
+
+  const fmtN=v=>new Intl.NumberFormat("da-DK").format(v);
+
+  return <div style={{background:"#fff",borderRadius:12,border:"1px solid #e5e7eb",padding:"16px 16px 14px",marginTop:16}}>
+    {/* Header row: title + legend */}
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+      <div style={{fontSize:13,fontWeight:700,color:"#1f2937"}}>
+        Break-even
+        {cross ? <span style={{fontWeight:600,color:"#92400e"}}>{" "}· skifter ved {fmtN(cross)} stk</span>
+               : <span style={{fontWeight:500,color:"#9ca3af"}}>{" "}· ingen krydsning</span>}
+      </div>
+      <div style={{display:"flex",gap:16,fontSize:11,fontWeight:600}}>
+        <span style={{display:"flex",alignItems:"center",gap:5}}>
+          <span style={{width:16,height:3,borderRadius:2,background:"#059669",display:"inline-block"}}/>
+          <span style={{color:"#059669"}}>Digital</span>
+        </span>
+        <span style={{display:"flex",alignItems:"center",gap:5}}>
+          <span style={{width:16,height:3,borderRadius:2,background:"#2563eb",display:"inline-block"}}/>
+          <span style={{color:"#2563eb"}}>Flexo</span>
+        </span>
+      </div>
+    </div>
+    {/* Chart */}
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",display:"block"}} preserveAspectRatio="xMidYMid meet">
+      {/* Y grid + labels */}
+      {yTicks.map((v,i)=><g key={"y"+i}>
+        <line x1={pad.l} x2={W-pad.r} y1={y(v)} y2={y(v)} stroke={v===0?"#d1d5db":"#f3f4f6"} strokeWidth={v===0?1:0.5}/>
+        <text x={pad.l-6} y={y(v)+3.5} textAnchor="end" fontSize={9} fill="#9ca3af" fontFamily="system-ui">{fmtKr(v)}</text>
+      </g>)}
+      {/* X grid + labels */}
+      {xTicks.map((v,i)=><g key={"x"+i}>
+        <line x1={x(v)} x2={x(v)} y1={pad.t} y2={H-pad.b} stroke="#f3f4f6" strokeWidth={0.5}/>
+        <text x={x(v)} y={H-pad.b+13} textAnchor="middle" fontSize={9} fill="#9ca3af" fontFamily="system-ui">{fmtK(v)}</text>
+      </g>)}
+      {/* X axis label */}
+      <text x={pad.l+cW/2} y={H-4} textAnchor="middle" fontSize={9} fill="#d1d5db" fontFamily="system-ui">antal</text>
+      {/* Crossover zone */}
+      {cross && crossY!=null && <>
+        <line x1={x(cross)} x2={x(cross)} y1={pad.t} y2={H-pad.b} stroke="#f59e0b" strokeWidth={1} strokeDasharray="4,4" opacity={0.6}/>
+        <circle cx={x(cross)} cy={crossY} r={4.5} fill="#f59e0b" stroke="#fff" strokeWidth={2}/>
+      </>}
+      {/* Current qty */}
+      {currentQty>=200 && currentQty<=maxQ && <>
+        <line x1={x(currentQty)} x2={x(currentQty)} y1={pad.t} y2={H-pad.b} stroke="#9ca3af" strokeWidth={0.75} strokeDasharray="2,3"/>
+        <text x={x(currentQty)} y={H-pad.b+24} textAnchor="middle" fontSize={8} fill="#9ca3af" fontFamily="system-ui" fontWeight={600}>▲ {fmtN(currentQty)}</text>
+      </>}
+      {/* Data lines */}
+      <path d={dPath} fill="none" stroke="#059669" strokeWidth={2} strokeLinejoin="round"/>
+      <path d={fPath} fill="none" stroke="#2563eb" strokeWidth={2} strokeLinejoin="round"/>
+    </svg>
+  </div>;
+}
+
+function Check({checked,onChange,label}) {
+  return <label onClick={onChange} style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",fontSize:14,fontWeight:500,color:"#374151",userSelect:"none"}}>
+    <div style={{width:20,height:20,borderRadius:5,flexShrink:0,border:checked?"2px solid #2563eb":"2px solid #9ca3af",background:checked?"#2563eb":"#fff",display:"flex",alignItems:"center",justifyContent:"center",transition:"all 0.15s"}}>
+      {checked&&<span style={{color:"#fff",fontSize:13,fontWeight:700}}>✓</span>}
+    </div>{label}
+  </label>;
+}
+
+function BDTable({title,color,data,total,kliche}) {
+  return <div style={{flex:1,minWidth:240}}>
+    <div style={{fontSize:13,fontWeight:700,color,marginBottom:8,display:"flex",alignItems:"center",gap:6}}>
+      <span style={{width:10,height:10,borderRadius:"50%",background:color,display:"inline-block"}}/>{title}
+    </div>
+    <div style={{background:"#f9fafb",borderRadius:10,padding:16,border:"1px solid #e5e7eb"}}>
+      {Object.entries(data).filter(([,v])=>v>0.5).map(([k,v])=>
+        <div key={k} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",fontSize:13,color:"#374151"}}>
+          <span style={{textTransform:"capitalize"}}>{k}</span>
+          <span style={{fontWeight:500,fontVariantNumeric:"tabular-nums"}}>{fmt(v)} kr</span>
+        </div>
+      )}
+      {kliche!=null && kliche>0 && <>
+        <div style={{display:"flex",justifyContent:"space-between",padding:"6px 0 3px",marginTop:6,borderTop:"1px dashed #fbbf24",fontSize:13,color:"#92400e",fontWeight:600}}>
+          <span>🔸 Klichéer (nye)</span>
+          <span>{fmt(kliche)} kr</span>
+        </div>
+      </>}
+      <div style={{display:"flex",justifyContent:"space-between",padding:"8px 0 3px",marginTop:8,borderTop:`2px solid ${color}`,fontWeight:700,fontSize:15}}>
+        <span>Total</span><span>{fmt(total)} kr</span>
+      </div>
+    </div>
+  </div>;
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+function App() {
+  const [qty,setQty]=useState("12000");
+  const [w,setW]=useState("100");
+  const [h,setH]=useState("60");
+  const [colors,setColors]=useState(4);
+  const [matId,setMatId]=useState("BT618-430");
+  const [finish,setFinish]=useState("lak_mat");
+  const [ordreType,setOrdreType]=useState("ny"); // ny / genbestilling / rettelse
+  const [eksistKliche,setEksistKliche]=useState(false); // har vi eksist. flexo-klichéer?
+  const [retKlicher,setRetKlicher]=useState(1); // antal nye klichéer ved rettelse
+  const [vende,setVende]=useState(false);
+  const [limd,setLimd]=useState(false);
+  const [pantone,setPantone]=useState(false);
+  const [haster,setHaster]=useState(false);
+  const [orient,setOrient]=useState("auto");
+  const [perRoll,setPerRoll]=useState("4000");
+  const [shape,setShape]=useState("rectangle");
+  const [showDet,setShowDet]=useState(false);
+  const [scenarios,setScenarios]=useState([]);
+
+  // === BC state ===
+  const [bcUser,  setBcUser]  = useState(null);   // { token, username }
+  const [bcModal, setBcModal] = useState(false);
+  const [bcLoading, setBcLoading] = useState(false);
+  const [bcError, setBcError] = useState("");
+  const [bcSuccess, setBcSuccess] = useState(""); // tilbudsnummer efter oprettelse
+
+  const saveScenario = () => {
+    if (!result || scenarios.length >= 3) return;
+    const matName = mat ? mat.name.substring(0,30) : matId;
+    const label = `${qty} stk · ${w}×${h}mm · ${colors}f`;
+    const sc = {
+      id: Date.now(),
+      label,
+      inputs: { qty:+qty, w:+w, h:+h, colors, matId, matName, finish, ordreType, nKliche:result.nk, pantone, haster, vende, limd },
+      d: result.d ? { total:result.d.total, meters:result.d.meters, across:result.d.across, util:result.d.util, stk:result.d.total/(+qty) } : null,
+      f: result.f ? { total:result.f.total, meters:result.f.meters, across:result.f.across, around:result.f.around, util:result.f.util, stk:result.f.total/(+qty), kliche:result.f.kliche } : null,
+      rec: result.rec,
+      expl: result.expl,
+    };
+    setScenarios(prev => [...prev, sc]);
+  };
+  const removeScenario = (id) => setScenarios(prev => prev.filter(s => s.id !== id));
+
+  // === BC: log ind ===
+  const bcLogin = async () => {
+    setBcError(""); setBcSuccess("");
+    setBcLoading(true);
+    try {
+      const user = await getToken();
+      setBcUser(user);
+      setBcModal(true);
+    } catch(e) {
+      setBcError(e.message||"Login fejlede");
+    } finally {
+      setBcLoading(false);
+    }
+  };
+
+  // === BC: opret tilbud ===
+  const bcCreateQuote = async (custNo, jobName) => {
+    if (!bcUser||!result) return;
+    setBcLoading(true); setBcError("");
+    try {
+      const productGroup = getProductGroup(finish);
+      const formatCode = `${w}X${h}`;
+      const recTxt = result.rec.lvl==="digital"?"Digital (HP Indigo)":result.rec.lvl==="flexo"?"Flexo (BOBST M5)":"Tæt på – overvej begge";
+
+      // Opret Web2PV ordre med header + linje + komponent i ét kald
+      const body = {
+        entryType: "Submit Order",
+        frontendID: "DECISION-TOOL",
+        sellToNo: custNo,
+        yourReference: jobName || `Beslutningsværktøj ${new Date().toLocaleDateString("da-DK")}`,
+        pvsweb2pvslines: [
+          {
+            productGroup,
+            description: jobName || `${formatCode}mm ${recTxt}`,
+            quantity: +qty,
+            formatCode,
+            pvsweb2pvscomponents: [
+              {
+                colorsFront: +colors,
+                paperItemNo: matId,
+                jobItemFormat: formatCode,
+              }
+            ]
+          }
+        ]
+      };
+
+      const resp = await pvPost(
+        `/web2pvsheaders/?$expand=pvsweb2pvslines($expand=pvsweb2pvscomponents)`,
+        bcUser.token,
+        body
+      );
+
+      setBcSuccess(`Web-ordre ${resp.no||resp.id?.substring(0,8)||"oprettet"} sendt til PrintVis ✓ — åbn "Web2PV Headers" i BC og tryk "Process"`);
+      setBcModal(false);
+    } catch(e) {
+      setBcError(e.message||"Ukendt fejl ved oprettelse");
+    } finally {
+      setBcLoading(false);
+    }
+  };
+
+  const mat = MATERIALS.find(m=>m.id===matId);
+
+  const result = useMemo(()=>{
+    const nQty=+qty, nW=+w, nH=+h;
+    if (!mat||nQty<1||nW<5||nH<5) return null;
+    const pr = Math.max(100, +perRoll||4000);
+    // Kliché-logik: ny=alle, genbestilling+eksist=0, rettelse+eksist=retKlicher, uden eksist=alle
+    const nk = ordreType==="ny" ? colors
+      : !eksistKliche ? colors
+      : ordreType==="rettelse" ? Math.min(retKlicher,colors)
+      : 0;
+    const d=calcDigital(nQty,nW,nH,colors,mat,finish,orient,pr,shape,vende,limd);
+    const f=calcFlexo(nQty,nW,nH,colors,mat,finish,nk,vende,limd,pr,orient);
+
+    // Find break-even crossover for recommendation
+    let cross=null;
+    if (d && f) {
+      const maxQ=Math.max(50000,nQty*4), steps=60;
+      for (let i=1;i<=steps;i++) {
+        const q0=Math.round(200+(maxQ-200)*((i-1)/steps));
+        const q1=Math.round(200+(maxQ-200)*(i/steps));
+        const d0=calcDigital(q0,nW,nH,colors,mat,finish,orient,pr,shape,vende,limd);
+        const f0=calcFlexo(q0,nW,nH,colors,mat,finish,nk,vende,limd,pr,orient);
+        const d1=calcDigital(q1,nW,nH,colors,mat,finish,orient,pr,shape,vende,limd);
+        const f1=calcFlexo(q1,nW,nH,colors,mat,finish,nk,vende,limd,pr,orient);
+        if (d0&&f0&&d1&&f1) {
+          const prev=d0.total-f0.total, curr=d1.total-f1.total;
+          if (prev*curr<0) { cross=Math.round(q0+prev/(prev-curr)*(q1-q0)); break; }
+        }
+      }
+    }
+    const rec=getRec(d,f,pantone,haster,nk);
+    const expl=getExpl(rec,d,f,colors,nQty,nk,pantone,haster,cross,mat,ordreType);
+    return {d,f,rec,expl,nk};
+  },[qty,w,h,colors,mat,finish,ordreType,eksistKliche,retKlicher,vende,limd,orient,perRoll,pantone,haster,shape]);
+
+  const I={width:"100%",padding:"10px 14px",borderRadius:8,border:"1.5px solid #d1d5db",fontSize:15,background:"#fff",outline:"none",fontVariantNumeric:"tabular-nums",boxSizing:"border-box"};
+  const L={fontSize:11,fontWeight:700,color:"#4b5563",marginBottom:5,display:"block",letterSpacing:"0.06em",textTransform:"uppercase"};
+
+  const badges={
+    digital:{bg:"linear-gradient(135deg,#065f46,#059669)",icon:"⚡",txt:"Digital (HP Indigo)"},
+    flexo:{bg:"linear-gradient(135deg,#1e3a5f,#2563EB)",icon:"🔄",txt:"Flexo (BOBST M5)"},
+    tæt:{bg:"linear-gradient(135deg,#92400e,#d97706)",icon:"⚖️",txt:"Tæt på – overvej begge"},
+    error:{bg:"linear-gradient(135deg,#7f1d1d,#DC2626)",icon:"⚠️",txt:"Kan ikke beregnes"},
+  };
+
+  return <div style={{fontFamily:"'DM Sans','Segoe UI',system-ui,sans-serif",maxWidth:780,margin:"0 auto",color:"#111827"}}>
+    {/* Header */}
+    <div style={{marginBottom:22,borderBottom:"2px solid #111827",paddingBottom:12}}>
+      <div style={{display:"flex",alignItems:"center",gap:10}}>
+        <div style={{width:34,height:34,borderRadius:8,background:"#111827",display:"flex",alignItems:"center",justifyContent:"center",fontSize:17}}>🏭</div>
+        <div>
+          <h1 style={{fontSize:20,fontWeight:800,margin:0,letterSpacing:"-0.02em"}}>Digital eller Flexo?</h1>
+          <p style={{fontSize:12,color:"#9ca3af",margin:0}}>Beslutningsværktøj · Ecco Print A/S</p>
+        </div>
+      </div>
+    </div>
+
+    {/* Inputs */}
+    <div style={{background:"#f8f9fa",padding:18,borderRadius:14,border:"1px solid #e5e7eb",marginBottom:22}}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:12,marginBottom:12}}>
+        <div><label style={L}>Antal etiketter</label><input type="number" style={I} value={qty} onChange={e=>setQty(e.target.value)} onBlur={()=>setQty(v=>String(Math.max(1,+v||0)))}/></div>
+        <div><label style={L}>Bredde (mm)</label><input type="number" style={I} value={w} onChange={e=>setW(e.target.value)} onBlur={()=>setW(v=>String(Math.max(5,+v||0)))}/></div>
+        <div><label style={L}>Højde (mm)</label><input type="number" style={I} value={h} onChange={e=>setH(e.target.value)} onBlur={()=>setH(v=>String(Math.max(5,+v||0)))}/></div>
+        <div><label style={L}>Antal farver</label>
+          <select style={I} value={colors} onChange={e=>setColors(+e.target.value)}>
+            {[0,1,2,3,4,5,6,7,8].map(n=><option key={n} value={n}>{n===0?"Ingen (neutral)":n===4?"4 (CMYK)":n}</option>)}
+          </select></div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr",gap:12,marginBottom:12}}>
+        <div><label style={L}>Materiale (varenr.)</label><SearchSelect options={MATERIALS} value={matId} onChange={setMatId} placeholder="Søg..."/></div>
+        <div><label style={L}>Efterbehandling</label>
+          <select style={I} value={finish} onChange={e=>setFinish(e.target.value)}>
+            {FINISHES.map(f=><option key={f.id} value={f.id}>{f.name}</option>)}
+          </select></div>
+        <div><label style={L}>Etiketretning</label>
+          <select style={I} value={orient} onChange={e=>setOrient(e.target.value)}>
+            <option value="auto">Auto (bedste)</option>
+            <option value="h_across">Top og bund ↕</option>
+            <option value="w_across">Højre og venstre ↔</option>
+          </select></div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+        <div><label style={L}>Antal pr. rulle</label>
+          <input type="number" style={I} value={perRoll} onChange={e=>setPerRoll(e.target.value)} onBlur={()=>setPerRoll(v=>String(Math.max(100,+v||4000)))}/></div>
+        {/* Etiketform parkeret – tilføjes hvis relevant
+        <div><label style={L}>Etiketform (digital stans)</label>
+          <select style={I} value={shape} onChange={e=>setShape(e.target.value)}>
+            <option value="rectangle">Rektangulær / firkantet</option>
+            <option value="round">Rund / oval</option>
+            <option value="bespoke">Specialform (600 kr)</option>
+          </select></div>
+        */}
+      </div>
+      <div style={{display:"flex",gap:20,flexWrap:"wrap",marginBottom:8,alignItems:"center"}}>
+        <label style={{display:"flex",alignItems:"center",gap:6,fontSize:14,fontWeight:500,color:"#374151"}}>
+          Ordretype
+          <select style={{padding:"4px 8px",borderRadius:6,border:"1.5px solid #d1d5db",fontSize:14,background:"#fff"}} value={ordreType} onChange={e=>setOrdreType(e.target.value)}>
+            <option value="ny">Ny ordre</option>
+            <option value="genbestilling">Genbestilling</option>
+            <option value="rettelse">Genbestilling m. rettelse</option>
+          </select>
+        </label>
+        {ordreType!=="ny" && <Check checked={eksistKliche} onChange={()=>setEksistKliche(!eksistKliche)} label="Eksist. flexo-klichéer"/>}
+        {ordreType==="rettelse" && eksistKliche && <label style={{display:"flex",alignItems:"center",gap:6,fontSize:14,fontWeight:500,color:"#374151"}}>
+          Nye klichéer
+          <select style={{padding:"4px 8px",borderRadius:6,border:"1.5px solid #d1d5db",fontSize:14,background:"#fff"}} value={retKlicher} onChange={e=>setRetKlicher(+e.target.value)}>
+            {Array.from({length:Math.max(colors-1,1)},(_,i)=>i+1).map(n=>
+              <option key={n} value={n}>{n} stk</option>
+            )}
+          </select>
+        </label>}
+        <Check checked={vende} onChange={()=>setVende(!vende)} label="Vendesløjfe"/>
+        <Check checked={limd} onChange={()=>setLimd(!limd)} label="Limdræber"/>
+      </div>
+      <div style={{display:"flex",gap:20,flexWrap:"wrap"}}> 
+        <Check checked={pantone} onChange={()=>setPantone(!pantone)} label="Pantone"/>
+        <Check checked={haster} onChange={()=>setHaster(!haster)} label="Haster (< 3 dage)"/>
+      </div>
+      {mat&&<div style={{marginTop:10,fontSize:12,color:"#6b7280",display:"flex",gap:16}}>
+        <span>Flexo: <b>{mat.width} mm</b></span>
+        {(()=>{const dv=findDigitalVariant(mat);
+          if(!dv) return <span style={{color:"#dc2626"}}>Digital: ❌ ingen variant ≤333 mm</span>;
+          if(dv.id!==mat.id) return <span>Digital: <b>{dv.id}</b> ({dv.width} mm)</span>;
+          return <span>Digital: <b>{dv.width} mm</b> (samme)</span>;
+        })()}
+      </div>}
+    </div>
+
+    {/* Results */}
+    {result&&(()=>{
+      const b=badges[result.rec.lvl]||badges.error;
+      const conf=result.rec.conf==="high"?"Klar anbefaling":result.rec.conf==="medium"?"Sandsynlig anbefaling":"Lille forskel";
+      const override=result.rec.override;
+      return <div>
+        <div style={{background:b.bg,borderRadius:14,padding:"22px 26px",color:"#fff",marginBottom:18}}>
+          <div style={{fontSize:12,opacity:0.85,fontWeight:600,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:4}}>
+            {result.rec.lvl!=="error"?conf:"Fejl"}{override==="pantone"?" · Pantone vejer ind":""}{override==="haster"?" · Hasteordre vejer ind":""}</div>
+          <div style={{fontSize:24,fontWeight:700,display:"flex",alignItems:"center",gap:10}}>
+            <span>{b.icon}</span><span>{b.txt}</span></div>
+        </div>
+
+        <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:12,padding:"14px 16px",marginBottom:18}}>
+          <div style={{fontSize:11,fontWeight:700,color:"#92400e",marginBottom:8,textTransform:"uppercase",letterSpacing:"0.04em"}}>Indsigter</div>
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {result.expl.map((l,i)=><div key={i} style={{display:"flex",gap:8,alignItems:"flex-start",fontSize:13.5,color:"#78350f",lineHeight:1.5}}>
+              <span style={{flexShrink:0,fontSize:14,lineHeight:"22px"}}>{l.icon}</span>
+              <span>{l.txt}</span>
+            </div>)}
+          </div>
+        </div>
+
+        {/* Price cards */}
+        <div style={{display:"grid",gridTemplateColumns:result.d&&result.f?"1fr 1fr":"1fr",gap:14,marginBottom:16}}>
+          {result.d&&<div style={{textAlign:"center",padding:14,borderRadius:12,background:result.rec.lvl==="digital"?"#f0fdf4":"#f9fafb",border:result.rec.lvl==="digital"?"2px solid #059669":"1px solid #e5e7eb"}}>
+            <div style={{fontSize:11,color:"#6b7280",fontWeight:600,textTransform:"uppercase"}}>Digital (HP Indigo)</div>
+            <div style={{fontSize:26,fontWeight:800,color:"#059669",marginTop:3}}>{fmt(result.d.total)} kr</div>
+          </div>}
+          {result.f&&<div style={{textAlign:"center",padding:14,borderRadius:12,background:result.rec.lvl==="flexo"?"#eff6ff":"#f9fafb",border:result.rec.lvl==="flexo"?"2px solid #2563eb":"1px solid #e5e7eb"}}>
+            <div style={{fontSize:11,color:"#6b7280",fontWeight:600,textTransform:"uppercase"}}>Flexo (BOBST M5)</div>
+            <div style={{fontSize:26,fontWeight:800,color:"#2563eb",marginTop:3}}>{fmt(result.f.total)} kr</div>
+            {result.f.kliche>0&&<div style={{fontSize:12,marginTop:4,color:"#92400e",fontWeight:600}}>
+              heraf klichéer: {fmt(result.f.kliche)} kr
+              <span style={{fontWeight:400,color:"#b45309"}}> · uden klichéer: {fmt(result.f.baseTotal)} kr</span>
+            </div>}
+          </div>}
+        </div>
+
+        {/* Layout */}
+        <div style={{display:"grid",gridTemplateColumns:result.d&&result.f?"1fr 1fr":"1fr",gap:14,marginBottom:16,fontSize:13,color:"#4b5563"}}>
+          {result.d&&<div style={{background:"#f9fafb",borderRadius:10,padding:12,border:"1px solid #e5e7eb"}}>
+            <div style={{fontWeight:700,color:"#059669",marginBottom:4,fontSize:11,textTransform:"uppercase"}}>Digital layout</div>
+            <div>{result.d.across} tværs · {fmtD(result.d.meters,1)} m · {result.d.matW} mm bane · {result.d.orientUsed==="w_across"?"↔ højre/venstre":"↕ top/bund"} · <b>{result.d.util}%</b> udnyttelse</div>
+            <div style={{fontSize:12,color:"#9ca3af"}}>Materiale: {result.d.matId}{result.d.diffMat?" (smallere variant)":""} · Pristrin: {colors>=4?"4+ farver":colors>=1?"1 farve":"neutral"} · {result.d.numRolls} rulle{result.d.numRolls!==1?"r":""}</div>
+          </div>}
+          {result.f&&<div style={{background:"#f9fafb",borderRadius:10,padding:12,border:"1px solid #e5e7eb"}}>
+            <div style={{fontWeight:700,color:"#2563eb",marginBottom:4,fontSize:11,textTransform:"uppercase"}}>Flexo layout</div>
+            <div>{result.f.across} tværs · {result.f.around} rundt · {result.f.Z}Z · {fmtD(result.f.meters,1)} m · {result.f.fw} mm · {result.f.orientUsed==="w_across"?"↔ højre/venstre":"↕ top/bund"} · <b>{result.f.util}%</b> udnyttelse</div>
+            <div style={{fontSize:12,color:"#9ca3af"}}>{colors} farve{colors!==1?"r":""}{result.nk>0?` · ${result.nk}×750 kr nye klichéer`:" · eksist. klichéer"}{vende?" · vende":""}{limd?" · limd":""} · gap {fmtD(result.f.gapAround,1)} mm · {result.f.numRolls} rulle{result.f.numRolls!==1?"r":""}</div>
+          </div>}
+        </div>
+
+        {result.d && result.f && <BreakEvenChart w={+w} h={+h} colors={colors} mat={mat} finish={finish} orient={orient} perRoll={Math.max(100,+perRoll||4000)} shape={shape} nKliche={result.nk} vende={vende} limd={limd} currentQty={+qty}/>}
+
+        {/* Save scenario button */}
+        <button
+          onClick={saveScenario}
+          disabled={scenarios.length>=3}
+          style={{width:"100%",padding:"11px 16px",background:scenarios.length>=3?"#f3f4f6":"#1f2937",color:scenarios.length>=3?"#9ca3af":"#fff",border:"none",borderRadius:10,cursor:scenarios.length>=3?"not-allowed":"pointer",fontSize:14,fontWeight:600,marginTop:16,letterSpacing:"0.01em",transition:"background 0.15s"}}
+        >
+          {scenarios.length>=3 ? "Maks 3 scenarier gemt" : `＋ Gem som scenarie ${scenarios.length+1}`}
+        </button>
+
+        {/* ===== BC KNAP ===== */}
+        <div style={{marginTop:10}}>
+          {!bcUser
+            ? <button
+                onClick={bcLogin}
+                disabled={bcLoading}
+                style={{width:"100%",padding:"12px 16px",background:bcLoading?"#e5e7eb":"#0078d4",color:bcLoading?"#9ca3af":"#fff",border:"none",borderRadius:10,cursor:bcLoading?"wait":"pointer",fontSize:14,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",gap:8,transition:"background 0.15s"}}>
+                {bcLoading
+                  ? "⏳ Logger ind med Microsoft..."
+                  : <><span style={{fontSize:16}}>🔗</span><span>Log ind og opret tilbud i Business Central</span></>}
+              </button>
+            : <button
+                onClick={()=>{ setBcError(""); setBcSuccess(""); setBcModal(true); }}
+                style={{width:"100%",padding:"12px 16px",background:"#0078d4",color:"#fff",border:"none",borderRadius:10,cursor:"pointer",fontSize:14,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+                <span style={{fontSize:16}}>📋</span>
+                <span>Opret tilbud i Business Central</span>
+                <span style={{marginLeft:"auto",fontSize:11,opacity:0.8,fontWeight:400}}>logget ind som {bcUser.username.split("@")[0]}</span>
+              </button>
+          }
+          {bcSuccess && <div style={{marginTop:8,padding:"10px 14px",background:"#f0fdf4",border:"1px solid #86efac",borderRadius:8,fontSize:13,color:"#166534",fontWeight:600,textAlign:"center"}}>✅ {bcSuccess}</div>}
+          {bcError   && <div style={{marginTop:8,padding:"10px 14px",background:"#fef2f2",border:"1px solid #fecaca",borderRadius:8,fontSize:13,color:"#991b1b",textAlign:"center"}}>⚠️ {bcError}</div>}
+        </div>
+
+        <button onClick={()=>setShowDet(!showDet)} style={{width:"100%",padding:"10px 16px",background:"none",border:"1px solid #d1d5db",borderRadius:10,cursor:"pointer",fontSize:14,fontWeight:600,color:"#4b5563",display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:showDet?14:0,marginTop:16}}>
+          <span>Detaljeret prisopbygning</span>
+          <span style={{transform:showDet?"rotate(180deg)":"none",transition:"transform 0.2s"}}>▼</span>
+        </button>
+
+        {showDet&&<div style={{display:"flex",gap:14,flexWrap:"wrap"}}>
+          {result.d&&<BDTable title="Digital" color="#059669" data={result.d.bd} total={result.d.total}/>}
+          {result.f&&<BDTable title="Flexo" color="#2563eb" data={result.f.bd} total={result.f.total} kliche={result.f.kliche}/>}
+        </div>}
+
+        <div style={{marginTop:18,padding:"10px 14px",background:"#f3f4f6",borderRadius:8,fontSize:11,color:"#9ca3af",lineHeight:1.5}}>
+          Estimat baseret på standardpriser (juni 2025). Klichéer: 750 kr/stk (vises separat, kalkuleres i PrintVis).
+          Digital pristrin: neutral / 1 farve / 4+. Flexo beregner pr. farvestation. Fragt og emballage indgår ikke.
+        </div>
+      </div>;
+    })()}
+
+    {/* ===== SCENARIO COMPARISON ===== */}
+    {scenarios.length > 0 && <div style={{marginTop:32}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+        <div style={{fontSize:18,fontWeight:800,color:"#1f2937"}}>Sammenlign scenarier</div>
+        <button onClick={()=>setScenarios([])} style={{fontSize:12,color:"#9ca3af",background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>Ryd alle</button>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:scenarios.length===1?"1fr":scenarios.length===2?"1fr 1fr":"1fr 1fr 1fr",gap:12}}>
+        {scenarios.map((sc,idx)=>{
+          const colors_sc = ["#f59e0b","#8b5cf6","#06b6d4"];
+          const accent = colors_sc[idx];
+          const badgeLvl = sc.rec?.lvl;
+          const recLabel = badgeLvl==="digital"?"Digital":badgeLvl==="flexo"?"Flexo":"Tæt på";
+          const cheapest = sc.d && sc.f ? (sc.d.total < sc.f.total ? "digital" : sc.f.total < sc.d.total ? "flexo" : "tie") : sc.d ? "digital" : "flexo";
+          return <div key={sc.id} style={{border:`2px solid ${accent}22`,borderRadius:14,background:"#fff",overflow:"hidden"}}>
+            {/* Header */}
+            <div style={{background:`${accent}11`,padding:"12px 14px",borderBottom:`1px solid ${accent}22`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div>
+                <div style={{fontSize:10,fontWeight:700,color:accent,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:2}}>Scenarie {idx+1}</div>
+                <div style={{fontSize:13,fontWeight:700,color:"#1f2937"}}>{sc.label}</div>
+              </div>
+              <button onClick={()=>removeScenario(sc.id)} style={{width:22,height:22,borderRadius:6,border:"none",background:`${accent}18`,color:accent,cursor:"pointer",fontSize:14,lineHeight:"22px",fontWeight:700}}>×</button>
+            </div>
+
+            {/* Inputs summary */}
+            <div style={{padding:"10px 14px",fontSize:11,color:"#6b7280",lineHeight:1.6,borderBottom:"1px solid #f3f4f6"}}>
+              <div>{sc.inputs.matName}</div>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:2}}>
+                <span>{sc.inputs.finish.replace("_"," ")}</span>
+                <span>·</span>
+                <span>{sc.inputs.ordreType}</span>
+                {sc.inputs.nKliche>0 && <><span>·</span><span>{sc.inputs.nKliche} kl.</span></>}
+                {sc.inputs.pantone && <><span>·</span><span style={{color:"#d97706"}}>Pantone</span></>}
+                {sc.inputs.haster && <><span>·</span><span style={{color:"#dc2626"}}>Haster</span></>}
+              </div>
+            </div>
+
+            {/* Prices */}
+            <div style={{padding:"12px 14px"}}>
+              {sc.d && <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:6}}>
+                <span style={{fontSize:12,color:"#059669",fontWeight:600}}>Digital</span>
+                <div style={{textAlign:"right"}}>
+                  <span style={{fontSize:cheapest==="digital"?18:15,fontWeight:cheapest==="digital"?800:600,color:cheapest==="digital"?"#059669":"#6b7280"}}>{fmt(sc.d.total)} kr</span>
+                  <div style={{fontSize:10,color:"#9ca3af"}}>{fmtD(sc.d.stk,2)} kr/stk · {sc.d.util}% udnyt.</div>
+                </div>
+              </div>}
+              {sc.f && <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline"}}>
+                <span style={{fontSize:12,color:"#2563eb",fontWeight:600}}>Flexo</span>
+                <div style={{textAlign:"right"}}>
+                  <span style={{fontSize:cheapest==="flexo"?18:15,fontWeight:cheapest==="flexo"?800:600,color:cheapest==="flexo"?"#2563eb":"#6b7280"}}>{fmt(sc.f.total)} kr</span>
+                  <div style={{fontSize:10,color:"#9ca3af"}}>{fmtD(sc.f.stk,2)} kr/stk · {sc.f.util}% udnyt.</div>
+                </div>
+              </div>}
+            </div>
+
+            {/* Recommendation badge */}
+            <div style={{padding:"0 14px 12px"}}>
+              <div style={{padding:"6px 10px",borderRadius:6,fontSize:11,fontWeight:700,textAlign:"center",
+                background:badgeLvl==="digital"?"#ecfdf5":badgeLvl==="flexo"?"#eff6ff":"#fffbeb",
+                color:badgeLvl==="digital"?"#059669":badgeLvl==="flexo"?"#2563eb":"#d97706",
+              }}>→ {recLabel}</div>
+            </div>
+
+            {/* Key insights (max 2) */}
+            {sc.expl.length>0 && <div style={{padding:"0 14px 12px"}}>
+              {sc.expl.slice(0,2).map((l,j)=><div key={j} style={{fontSize:11,color:"#78350f",lineHeight:1.4,marginBottom:3}}>{l.icon} {l.txt}</div>)}
+            </div>}
+          </div>;
+        })}
+      </div>
+
+      {/* Comparison highlights */}
+      {scenarios.length>=2 && (()=>{
+        const diffs = [];
+        const all = scenarios.filter(s=>s.d&&s.f);
+        if (all.length>=2) {
+          // Price range
+          const dPrices = all.map(s=>s.d.total);
+          const fPrices = all.map(s=>s.f.total);
+          const dRange = Math.max(...dPrices)-Math.min(...dPrices);
+          const fRange = Math.max(...fPrices)-Math.min(...fPrices);
+          if (dRange>100) diffs.push(`Digital varierer ${fmt(Math.round(dRange))} kr mellem scenarierne.`);
+          if (fRange>100) diffs.push(`Flexo varierer ${fmt(Math.round(fRange))} kr mellem scenarierne.`);
+          // Recommendation changes
+          const recs = all.map(s=>s.rec?.lvl);
+          const uniqueRecs = [...new Set(recs)];
+          if (uniqueRecs.length>1) diffs.push("Anbefalingen skifter mellem scenarierne – det er tæt.");
+        }
+        if (diffs.length===0) return null;
+        return <div style={{marginTop:12,padding:"10px 14px",background:"#f0f9ff",border:"1px solid #bae6fd",borderRadius:8,fontSize:12,color:"#0c4a6e",lineHeight:1.6}}>
+          <span style={{fontWeight:700}}>Sammenligning: </span>
+          {diffs.join(" ")}
+        </div>;
+      })()}
+    </div>}
+
+    {/* ===== BC MODAL ===== */}
+    {bcModal && result && <BCQuoteModal
+      result={result}
+      inputs={{ qty:+qty, w:+w, h:+h, colors, matId, finishName: {none:"Ingen",lak_blank:"Lak blank",lak_mat:"Lak mat",lam_blank:"Laminat blank",lam_mat:"Laminat mat"}[finish]||finish }}
+      onConfirm={bcCreateQuote}
+      onClose={()=>setBcModal(false)}
+      isLoading={bcLoading}
+      errorMsg={bcError}
+    />}
+  </div>;
+}
+
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
